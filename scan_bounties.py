@@ -2,12 +2,18 @@
 """
 🛡️ GitHub Bounty Scanner — Powered by Doomsday Network & BountyGuard
 ====================================================================
-Scans live GitHub bounty issues and highlights verified on-chain escrowed
+Scans live GitHub bounty issues and highlights verified on‑chain escrowed
 bounties while flagging known scraper honeypots.
 """
 
+from __future__ import annotations
+
 import json
+import sys
+import urllib.error
 import urllib.request
+from dataclasses import dataclass
+from typing import Iterable, List
 
 KNOWN_BAD_ACTORS = {
     "zhangjiayang6835-cyber/bounty-plaza",
@@ -18,33 +24,87 @@ KNOWN_BAD_ACTORS = {
 }
 
 VERIFIED_ESCROW_ORGS = {"doomsday-network"}
+USER_AGENT = "DoomsdayBountyScanner/1.1"
+API_ENDPOINT = (
+    "https://api.github.com/search/issues"
+    "?q=is:issue+is:open+label:bounty"
+    "&sort=updated&order=desc&per_page={limit}"
+)
 
 
-def scan_live_bounties(limit: int = 15):
-    print("🛡️ Scanning live GitHub issues with label:bounty ...")
-    url = f"https://api.github.com/search/issues?q=is:issue+is:open+label:bounty&sort=updated&order=desc&per_page={limit}"
-    req = urllib.request.Request(url, headers={"User-Agent": "DoomsdayBountyScanner/1.1"})
-    data = json.loads(urllib.request.urlopen(req, timeout=10).read().decode("utf-8"))
+@dataclass(frozen=True, slots=True)
+class BountyItem:
+    repo_full: str
+    number: int
+    title: str
+    html_url: str
+    verdict: str
 
-    print(f"Found {data.get('total_count', 0)} open bounty issues. Auditing top {limit}:\n")
-    for item in data.get("items", []):
-        repo_url = item.get("repository_url", "")
-        repo_full = "/".join(repo_url.split("/")[-2:])
-        owner = repo_full.split("/")[0].lower()
-        num = item.get("number")
-        title = item.get("title", "")[:75]
+    @classmethod
+    def from_api(cls, raw: dict) -> "BountyItem":
+        repo_url: str = raw.get("repository_url", "")
+        repo_full: str = "/".join(repo_url.split("/")[-2:]).lower()
+        owner: str = repo_full.split("/", 1)[0]
 
-        if repo_full.lower() in KNOWN_BAD_ACTORS:
+        if repo_full in KNOWN_BAD_ACTORS:
             verdict = "🔴 QUARANTINE (Known Scraper Trap)"
         elif owner in VERIFIED_ESCROW_ORGS:
             verdict = "🟢 SAFE_WITH_ESCROW (Verified L1 + Base Mainnet Reserve)"
         else:
             verdict = "🟡 SAFE_NO_ESCROW (Unverified / Manual Maintainer Payout)"
 
-        print(f"  [{verdict}]")
-        print(f"    -> {repo_full}#{num}: {title}")
-        print(f"    -> URL: {item.get('html_url')}\n")
+        return cls(
+            repo_full=repo_full,
+            number=raw.get("number", 0),
+            title=raw.get("title", "")[:75],
+            html_url=raw.get("html_url", ""),
+            verdict=verdict,
+        )
+
+    def display(self) -> str:
+        lines = [
+            f"  [{self.verdict}]",
+            f"    -> {self.repo_full}#{self.number}: {self.title}",
+            f"    -> URL: {self.html_url}",
+        ]
+        return "\n".join(lines)
+
+
+def fetch_issues(limit: int = 15) -> List[dict]:
+    """Retrieve raw issue objects from the GitHub Search API."""
+    url = API_ENDPOINT.format(limit=limit)
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = response.read().decode("utf-8")
+        return json.loads(payload).get("items", [])
+    except urllib.error.HTTPError as exc:
+        sys.stderr.write(f"HTTP error {exc.code}: {exc.reason}\n")
+        return []
+    except urllib.error.URLError as exc:
+        sys.stderr.write(f"Network error: {exc.reason}\n")
+        return []
+    except json.JSONDecodeError as exc:
+        sys.stderr.write(f"Failed to parse JSON response: {exc}\n")
+        return []
+
+
+def scan_live_bounties(limit: int = 15) -> Iterable[BountyItem]:
+    """Yield processed bounty items ready for display."""
+    raw_items = fetch_issues(limit)
+    for raw in raw_items:
+        yield BountyItem.from_api(raw)
+
+
+def main(limit: int = 15) -> None:
+    print("🛡️ Scanning live GitHub issues with label:bounty ...")
+    items = list(scan_live_bounties(limit))
+    total = len(items)
+    print(f"Found {total} open bounty issues. Auditing top {limit}:\n")
+    for item in items:
+        print(item.display())
+        print()
 
 
 if __name__ == "__main__":
-    scan_live_bounties()
+    main()
